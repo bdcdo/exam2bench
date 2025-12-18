@@ -12,6 +12,12 @@ from .models import GabaritoExtraction, PageExtraction
 # Modelo Gemini a ser utilizado
 MODEL_NAME = "gemini-3-pro-preview"
 
+# Preços por milhão de tokens (USD)
+MODEL_PRICING = {
+    "pro": {"input": 2.00, "output": 12.00},
+    "flash": {"input": 0.50, "output": 3.00},
+}
+
 # Prompts para extração
 EXAM_EXTRACTION_PROMPT = """Analise esta imagem de uma página de prova de concurso público brasileiro.
 
@@ -24,7 +30,9 @@ Se contiver questões, para CADA questão visível extraia:
 
 IMPORTANTE:
 - Extraia TODAS as questões visíveis na página
-- Preserve o texto exatamente como escrito
+- TRANSCREVA LITERALMENTE o texto, sem corrigir erros ortográficos, gramaticais ou de digitação
+- O texto pode conter trechos em latim misturados com português - transcreva exatamente como está
+- NÃO altere, corrija ou "melhore" o texto de forma alguma
 - NÃO inclua títulos de seção (ex: "DIREITO PENAL", "DIREITO CIVIL") no enunciado"""
 
 GABARITO_EXTRACTION_PROMPT = """Analise esta imagem do gabarito de uma prova de concurso público brasileiro.
@@ -41,6 +49,13 @@ Extraia TODAS as respostas visíveis na página para o tipo de prova correto.
 Se a questão estiver anulada ou sem resposta, NÃO inclua na lista."""
 
 
+def _get_model_type(model_name: str) -> str:
+    """Detecta o tipo do modelo (pro ou flash) pelo nome."""
+    if "flash" in model_name.lower():
+        return "flash"
+    return "pro"
+
+
 @dataclass
 class TokenUsage:
     """Contabilização de tokens usados."""
@@ -55,8 +70,29 @@ class TokenUsage:
         self.output_tokens += other.output_tokens
         self.total_tokens += other.total_tokens
 
+    def calculate_cost(self, model_name: str = MODEL_NAME) -> float:
+        """Calcula o custo em USD baseado nos tokens usados.
+
+        Args:
+            model_name: Nome do modelo para determinar preços.
+
+        Returns:
+            Custo total em USD.
+        """
+        model_type = _get_model_type(model_name)
+        pricing = MODEL_PRICING[model_type]
+
+        input_cost = (self.input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (self.output_tokens / 1_000_000) * pricing["output"]
+
+        return input_cost + output_cost
+
     def __str__(self) -> str:
-        return f"Input: {self.input_tokens:,} | Output: {self.output_tokens:,} | Total: {self.total_tokens:,}"
+        cost = self.calculate_cost()
+        return (
+            f"Input: {self.input_tokens:,} | Output: {self.output_tokens:,} | "
+            f"Total: {self.total_tokens:,} | Custo: ${cost:.4f}"
+        )
 
 
 def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
@@ -106,9 +142,15 @@ def _extract_token_usage(raw_response) -> TokenUsage:
     usage = TokenUsage()
     if hasattr(raw_response, "usage_metadata") and raw_response.usage_metadata:
         metadata = raw_response.usage_metadata
-        usage.input_tokens = getattr(metadata, "input_tokens", 0) or 0
-        usage.output_tokens = getattr(metadata, "output_tokens", 0) or 0
-        usage.total_tokens = getattr(metadata, "total_tokens", 0) or 0
+        # Pode ser dict ou objeto com atributos
+        if isinstance(metadata, dict):
+            usage.input_tokens = metadata.get("input_tokens", 0) or 0
+            usage.output_tokens = metadata.get("output_tokens", 0) or 0
+            usage.total_tokens = metadata.get("total_tokens", 0) or 0
+        else:
+            usage.input_tokens = getattr(metadata, "input_tokens", 0) or 0
+            usage.output_tokens = getattr(metadata, "output_tokens", 0) or 0
+            usage.total_tokens = getattr(metadata, "total_tokens", 0) or 0
     return usage
 
 
@@ -143,6 +185,7 @@ def extract_exam_page(
             for q in result.questoes[:3]:  # Mostra até 3 questões
                 enunciado_preview = q.enunciado[:80] if q.enunciado else "(vazio)"
                 print(f"      - Q{q.numero}: {enunciado_preview}...")
+        print(f"      tokens: {token_usage}")
         print()
 
     return result, token_usage

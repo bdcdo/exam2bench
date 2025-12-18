@@ -22,6 +22,20 @@ EXAMS_DIR = Path("exams")
 OUTPUT_DIR = Path("output")
 
 
+def exam_already_processed(exam_name: str, output_dir: Path) -> bool:
+    """Verifica se uma prova já foi processada.
+
+    Args:
+        exam_name: Nome identificador do exame.
+        output_dir: Diretório de saída.
+
+    Returns:
+        True se o CSV de saída já existe.
+    """
+    output_path = output_dir / f"{exam_name}.csv"
+    return output_path.exists()
+
+
 def find_exam_pairs(exams_dir: Path) -> list[tuple[Path, Path, str]]:
     """Encontra pares de prova/gabarito no diretório.
 
@@ -135,6 +149,11 @@ def main():
         action="store_true",
         help="Ativa modo debug: imprime resposta raw do modelo Gemini",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Força reprocessamento mesmo se o CSV já existir",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -168,9 +187,16 @@ def main():
 
     # Processar cada par
     results = []
+    skipped = []
     grand_total_usage = TokenUsage()
 
     for prova, gabarito, name in pairs:
+        # Verificar se a prova já foi processada
+        if not args.force and exam_already_processed(name, OUTPUT_DIR):
+            print(f"\n→ Pulando '{name}' (já existe em output/)")
+            skipped.append(name)
+            continue
+
         try:
             output_path, usage = process_exam(prova, gabarito, name, debug=args.debug)
             results.append((name, output_path, None, usage))
@@ -191,6 +217,11 @@ def main():
         print(f"\nProcessados com sucesso ({len(successful)}):")
         for name, path, usage in successful:
             print(f"  ✓ {name} → {path}")
+
+    if skipped:
+        print(f"\nPulados - já existem ({len(skipped)}):")
+        for name in skipped:
+            print(f"  ⊘ {name}")
 
     if failed:
         print(f"\nFalharam ({len(failed)}):")
