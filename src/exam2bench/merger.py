@@ -1,19 +1,12 @@
 """Módulo para merge de questões extraídas e gabarito."""
 
-from dataclasses import dataclass
-
-from .models import GabaritoExtraction, PageExtraction, Question
-
-
-@dataclass
-class MergedQuestion:
-    """Questão final com todas as informações."""
-
-    numero: int
-    enunciado: str
-    alternativas: list[dict]  # [{"letra": "A", "texto": "..."}]
-    resposta_correta: str | None
-    prova_origem: str
+from .models import (
+    ExamAlternative,
+    ExamQuestion,
+    GabaritoExtraction,
+    PageExtraction,
+    Question,
+)
 
 
 def merge_multi_page_questions(
@@ -57,30 +50,48 @@ def collect_gabarito_answers(
 def merge_questions_with_gabarito(
     questions: list[Question],
     gabarito_answers: dict[int, str],
-    prova_name: str,
-) -> list[MergedQuestion]:
+    exam_source: str,
+    nullified_questions: set[int] | None = None,
+    metadata: dict | None = None,
+) -> list[ExamQuestion]:
     """Combina questões com suas respostas corretas.
 
     Args:
         questions: Lista de questões extraídas.
         gabarito_answers: Dicionário {número_questão: letra_resposta}.
-        prova_name: Nome/identificador da prova.
+        exam_source: Nome/identificador da prova.
+        nullified_questions: Conjunto de números de questões anuladas.
+        metadata: Metadados extras para todas as questões.
 
     Returns:
-        Lista de MergedQuestion com todas as informações.
+        Lista de ExamQuestion com todas as informações.
     """
+    nullified = nullified_questions or set()
+    base_metadata = metadata or {}
     merged = []
+
     for question in questions:
+        is_nullified = question.numero in nullified
+        correct = None if is_nullified else gabarito_answers.get(question.numero)
+
+        # Se não tem resposta no gabarito e não está explicitamente anulada,
+        # marca como anulada (comportamento legado)
+        if correct is None and not is_nullified:
+            is_nullified = True
+
         merged.append(
-            MergedQuestion(
-                numero=question.numero,
-                enunciado=question.enunciado,
-                alternativas=[
-                    {"letra": alt.letra, "texto": alt.texto}
+            ExamQuestion(
+                id=f"{exam_source}-{question.numero:03d}",
+                exam_source=exam_source,
+                question_number=question.numero,
+                statement=question.enunciado,
+                alternatives=[
+                    ExamAlternative(letter=alt.letra, text=alt.texto)
                     for alt in question.alternativas
                 ],
-                resposta_correta=gabarito_answers.get(question.numero),
-                prova_origem=prova_name,
+                correct_answer=correct,
+                nullified=is_nullified,
+                metadata=dict(base_metadata),
             )
         )
     return merged

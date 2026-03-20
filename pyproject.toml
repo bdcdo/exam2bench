@@ -12,20 +12,21 @@ dependencies = [
 ]
 
 [project.scripts]
-exam2bench = "exam2bench:main"
+exam2bench = "exam2bench.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/exam2bench"]
+packages = ["src/exam2bench", "products"]
 
 [dependency-groups]
 dev = [
+    "datasets>=4.8.3",
     "pytest>=9.0.2",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

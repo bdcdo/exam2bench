@@ -3,13 +3,14 @@
 import pytest
 
 from exam2bench.merger import (
-    MergedQuestion,
     collect_gabarito_answers,
     merge_multi_page_questions,
     merge_questions_with_gabarito,
 )
 from exam2bench.models import (
     Alternative,
+    ExamAlternative,
+    ExamQuestion,
     GabaritoAnswer,
     GabaritoExtraction,
     PageExtraction,
@@ -187,12 +188,12 @@ class TestMergeQuestionsWithGabarito:
         result = merge_questions_with_gabarito(questions, answers, "prova-teste")
 
         assert len(result) == 2
-        assert result[0].resposta_correta == "A"
-        assert result[1].resposta_correta == "B"
-        assert all(q.prova_origem == "prova-teste" for q in result)
+        assert result[0].correct_answer == "A"
+        assert result[1].correct_answer == "B"
+        assert all(q.exam_source == "prova-teste" for q in result)
 
-    def test_question_without_answer(self):
-        """Questão sem resposta no gabarito (anulada)."""
+    def test_question_without_answer_is_nullified(self):
+        """Questão sem resposta no gabarito deve ser marcada como anulada."""
         questions = [
             Question(
                 numero=1,
@@ -209,11 +210,38 @@ class TestMergeQuestionsWithGabarito:
 
         result = merge_questions_with_gabarito(questions, answers, "prova")
 
-        assert result[0].resposta_correta == "A"
-        assert result[1].resposta_correta is None
+        assert result[0].correct_answer == "A"
+        assert result[0].nullified is False
+        assert result[1].correct_answer is None
+        assert result[1].nullified is True
 
-    def test_alternatives_converted_to_dicts(self):
-        """Alternativas devem ser convertidas para dicionários."""
+    def test_explicit_nullified_questions(self):
+        """Questões explicitamente marcadas como anuladas."""
+        questions = [
+            Question(
+                numero=1,
+                enunciado="Pergunta normal",
+                alternativas=[Alternative(letra="A", texto="Opt")],
+            ),
+            Question(
+                numero=2,
+                enunciado="Questão anulada",
+                alternativas=[Alternative(letra="A", texto="Opt")],
+            ),
+        ]
+        answers = {1: "A", 2: "B"}
+
+        result = merge_questions_with_gabarito(
+            questions, answers, "prova", nullified_questions={2}
+        )
+
+        assert result[0].correct_answer == "A"
+        assert result[0].nullified is False
+        assert result[1].correct_answer is None
+        assert result[1].nullified is True
+
+    def test_alternatives_converted_to_exam_alternatives(self):
+        """Alternativas devem ser convertidas para ExamAlternative."""
         questions = [
             Question(
                 numero=1,
@@ -227,7 +255,40 @@ class TestMergeQuestionsWithGabarito:
 
         result = merge_questions_with_gabarito(questions, {1: "A"}, "prova")
 
-        assert result[0].alternativas == [
-            {"letra": "A", "texto": "Primeira"},
-            {"letra": "B", "texto": "Segunda"},
+        assert len(result[0].alternatives) == 2
+        assert isinstance(result[0].alternatives[0], ExamAlternative)
+        assert result[0].alternatives[0].letter == "A"
+        assert result[0].alternatives[0].text == "Primeira"
+        assert result[0].alternatives[1].letter == "B"
+        assert result[0].alternatives[1].text == "Segunda"
+
+    def test_generates_correct_id(self):
+        """ID deve ser gerado como {exam_source}-{question_number:03d}."""
+        questions = [
+            Question(
+                numero=1,
+                enunciado="Pergunta",
+                alternativas=[Alternative(letra="A", texto="Opt")],
+            ),
         ]
+
+        result = merge_questions_with_gabarito(questions, {1: "A"}, "oab-25")
+
+        assert result[0].id == "oab-25-001"
+
+    def test_metadata_passed_through(self):
+        """Metadados devem ser passados para as questões."""
+        questions = [
+            Question(
+                numero=1,
+                enunciado="Pergunta",
+                alternativas=[Alternative(letra="A", texto="Opt")],
+            ),
+        ]
+
+        result = merge_questions_with_gabarito(
+            questions, {1: "A"}, "oab-25",
+            metadata={"edition": 25, "year": 2018},
+        )
+
+        assert result[0].metadata == {"edition": 25, "year": 2018}

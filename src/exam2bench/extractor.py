@@ -116,13 +116,16 @@ def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
     return decorator
 
 
-def create_model() -> ChatGoogleGenerativeAI:
+def create_model(model_name: str = MODEL_NAME) -> ChatGoogleGenerativeAI:
     """Cria instância do modelo Gemini.
+
+    Args:
+        model_name: Nome do modelo Gemini a utilizar.
 
     A API key deve estar configurada via variável de ambiente GOOGLE_API_KEY.
     """
     return ChatGoogleGenerativeAI(
-        model=MODEL_NAME,
+        model=model_name,
         thinking_level="low",  # Transcrição não precisa de raciocínio profundo
     )
 

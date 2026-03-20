@@ -14,3 +14,7 @@ wheels/
 # Other files
 /exams
 /output
+
+# Products
+products/oab/exams/
+products/oab/output/
