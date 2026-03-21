@@ -334,6 +334,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pydantic" },
     { name = "pymupdf" },
+    { name = "rich" },
 ]
 
 [package.dev-dependencies]
@@ -348,6 +349,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pymupdf", specifier = ">=1.26.7" },
+    { name = "rich", specifier = ">=14.0.0" },
 ]
 
 [package.metadata.requires-dev]

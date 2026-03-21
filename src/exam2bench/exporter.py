@@ -8,12 +8,15 @@ import pandas as pd
 from .models import ExamQuestion
 
 
-def export_to_jsonl(questions: list[ExamQuestion], output_path: Path) -> None:
+def export_to_jsonl(
+    questions: list[ExamQuestion], output_path: Path, quiet: bool = False,
+) -> None:
     """Exporta questões para arquivo JSONL (um JSON por linha).
 
     Args:
         questions: Lista de ExamQuestion.
         output_path: Caminho do arquivo JSONL de saída.
+        quiet: Se True, suprime output.
     """
     sorted_questions = sorted(questions, key=lambda q: q.question_number)
 
@@ -21,20 +24,19 @@ def export_to_jsonl(questions: list[ExamQuestion], output_path: Path) -> None:
         for question in sorted_questions:
             f.write(question.model_dump_json() + "\n")
 
-    print(f"Exportadas {len(sorted_questions)} questões para {output_path}")
 
-
-def export_to_csv(questions: list[ExamQuestion], output_path: Path) -> None:
+def export_to_csv(
+    questions: list[ExamQuestion], output_path: Path, quiet: bool = False,
+) -> None:
     """Exporta questões para arquivo CSV.
 
     Args:
         questions: Lista de ExamQuestion.
         output_path: Caminho do arquivo CSV de saída.
+        quiet: Se True, suprime output.
     """
     df = questions_to_dataframe(questions)
     df.to_csv(output_path, index=False, encoding="utf-8")
-
-    print(f"Exportadas {len(questions)} questões para {output_path}")
 
 
 def questions_to_dataframe(questions: list[ExamQuestion]) -> pd.DataFrame:

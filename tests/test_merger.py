@@ -42,11 +42,12 @@ class TestMergeMultiPageQuestions:
 
         extractions = [(1, PageExtraction(questoes=[q1, q2]))]
 
-        result = merge_multi_page_questions(extractions)
+        result, num_dupes = merge_multi_page_questions(extractions)
 
         assert len(result) == 2
         assert result[0].numero == 1
         assert result[1].numero == 2
+        assert num_dupes == 0
 
     def test_multiple_pages_questions(self):
         """Questões de múltiplas páginas devem ser concatenadas."""
@@ -66,11 +67,12 @@ class TestMergeMultiPageQuestions:
             (2, PageExtraction(questoes=[q2])),
         ]
 
-        result = merge_multi_page_questions(extractions)
+        result, num_dupes = merge_multi_page_questions(extractions)
 
         assert len(result) == 2
         assert result[0].numero == 1
         assert result[1].numero == 2
+        assert num_dupes == 0
 
     def test_pages_without_questions_are_skipped(self):
         """Páginas sem questões devem ser ignoradas."""
@@ -86,10 +88,11 @@ class TestMergeMultiPageQuestions:
             (3, PageExtraction(questoes=[])),  # Página em branco
         ]
 
-        result = merge_multi_page_questions(extractions)
+        result, num_dupes = merge_multi_page_questions(extractions)
 
         assert len(result) == 1
         assert result[0].numero == 1
+        assert num_dupes == 0
 
     def test_pages_out_of_order_are_sorted(self):
         """Páginas fora de ordem devem ser ordenadas antes do merge."""
@@ -110,11 +113,49 @@ class TestMergeMultiPageQuestions:
             (1, PageExtraction(questoes=[q1])),
         ]
 
-        result = merge_multi_page_questions(extractions)
+        result, num_dupes = merge_multi_page_questions(extractions)
 
         assert len(result) == 2
         assert result[0].numero == 1
         assert result[1].numero == 2
+        assert num_dupes == 0
+
+    def test_split_question_across_pages_is_merged(self):
+        """Questão na fronteira entre páginas: concatena enunciados, mantém alternativas mais completas."""
+        q1 = Question(
+            numero=1, enunciado="Pergunta 1",
+            alternativas=[Alternative(letra="A", texto="Resp")],
+        )
+        # Questão 2 dividida: primeira metade na pg 1, segunda metade na pg 2
+        q2_part1 = Question(
+            numero=2, enunciado="Início do enunciado da questão 2",
+            alternativas=[],
+        )
+        q2_part2 = Question(
+            numero=2, enunciado="continuação e final do enunciado.",
+            alternativas=[
+                Alternative(letra="A", texto="Opção A"),
+                Alternative(letra="B", texto="Opção B"),
+            ],
+        )
+        q3 = Question(
+            numero=3, enunciado="Pergunta 3",
+            alternativas=[Alternative(letra="A", texto="Resp")],
+        )
+
+        extractions = [
+            (1, PageExtraction(questoes=[q1, q2_part1])),
+            (2, PageExtraction(questoes=[q2_part2, q3])),
+        ]
+
+        result, num_dupes = merge_multi_page_questions(extractions)
+
+        assert len(result) == 3
+        assert num_dupes == 1
+        # Enunciado concatenado
+        assert result[1].enunciado == "Início do enunciado da questão 2 continuação e final do enunciado."
+        # Alternativas da versão mais completa (pg 2)
+        assert len(result[1].alternativas) == 2
 
 
 class TestCollectGabaritoAnswers:

@@ -11,22 +11,38 @@ from .models import (
 
 def merge_multi_page_questions(
     extractions: list[tuple[int, PageExtraction]]
-) -> list[Question]:
-    """Coleta todas as questões de todas as páginas.
+) -> tuple[list[Question], int]:
+    """Coleta e mescla questões de todas as páginas.
+
+    Questões na fronteira entre páginas são extraídas parcialmente em cada uma.
+    Quando detectada duplicata por número, concatena os enunciados e mantém
+    as alternativas da versão mais completa.
 
     Args:
         extractions: Lista de tuplas (número_página, PageExtraction).
 
     Returns:
-        Lista de questões ordenadas por página.
+        Tupla (questões mescladas, número de duplicatas mescladas).
     """
     sorted_extractions = sorted(extractions, key=lambda x: x[0])
 
-    all_questions: list[Question] = []
+    seen: dict[int, Question] = {}
+    total = 0
     for _, extraction in sorted_extractions:
-        all_questions.extend(extraction.questoes)
+        for q in extraction.questoes:
+            total += 1
+            if q.numero not in seen:
+                seen[q.numero] = q
+            else:
+                existing = seen[q.numero]
+                seen[q.numero] = Question(
+                    numero=q.numero,
+                    enunciado=existing.enunciado + " " + q.enunciado,
+                    alternativas=q.alternativas if len(q.alternativas) >= len(existing.alternativas) else existing.alternativas,
+                )
 
-    return all_questions
+    merged = sorted(seen.values(), key=lambda q: q.numero)
+    return merged, total - len(merged)
 
 
 def collect_gabarito_answers(

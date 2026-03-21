@@ -1,13 +1,17 @@
 """Extrator de questões e gabaritos usando LangChain + Gemini."""
 
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import wraps
+from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .models import GabaritoExtraction, PageExtraction
+from . import ui
 
 # Modelo Gemini a ser utilizado
 MODEL_NAME = "gemini-3-pro-preview"
@@ -103,7 +107,10 @@ def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
         def wrapper(*args, **kwargs):
             for attempt in range(max_retries):
                 try:
-                    return func(*args, **kwargs)
+                    result = func(*args, **kwargs)
+                    if attempt > 0:
+                        print(f"  Tentativa {attempt + 1} OK")
+                    return result
                 except Exception as e:
                     if attempt == max_retries - 1:
                         raise
@@ -126,7 +133,13 @@ def create_model(model_name: str = MODEL_NAME) -> ChatGoogleGenerativeAI:
     """
     return ChatGoogleGenerativeAI(
         model=model_name,
-        thinking_level="low",  # Transcrição não precisa de raciocínio profundo
+        thinking_level="low",
+        safety_settings={
+            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+        },
     )
 
 
@@ -157,7 +170,6 @@ def _extract_token_usage(raw_response) -> TokenUsage:
     return usage
 
 
-@retry_with_backoff(max_retries=3)
 def extract_exam_page(
     model: ChatGoogleGenerativeAI, image_base64: str, debug: bool = False
 ) -> tuple[PageExtraction, TokenUsage]:
@@ -178,6 +190,8 @@ def extract_exam_page(
     response = structured_model.invoke([message])
 
     result = response["parsed"]
+    if result is None:
+        raise ValueError("Structured output retornou None")
     token_usage = _extract_token_usage(response["raw"])
 
     # DEBUG: Mostrar o resultado do structured output
@@ -194,7 +208,6 @@ def extract_exam_page(
     return result, token_usage
 
 
-@retry_with_backoff(max_retries=3)
 def extract_gabarito_page(
     model: ChatGoogleGenerativeAI, image_base64: str
 ) -> tuple[GabaritoExtraction, TokenUsage]:
@@ -214,68 +227,190 @@ def extract_gabarito_page(
     response = structured_model.invoke([message])
 
     result = response["parsed"]
+    if result is None:
+        raise ValueError("Structured output retornou None")
     token_usage = _extract_token_usage(response["raw"])
 
     return result, token_usage
 
 
+def _load_page_cache(cache_dir: Path, page_num: int, model_class: type) -> object | None:
+    """Tenta carregar extração de página do cache."""
+    cache_file = cache_dir / f"page-{page_num:02d}.json"
+    if cache_file.exists():
+        return model_class.model_validate_json(cache_file.read_text(encoding="utf-8"))
+    return None
+
+
+def _save_page_cache(cache_dir: Path, page_num: int, extraction: object) -> None:
+    """Salva extração de página no cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"page-{page_num:02d}.json"
+    cache_file.write_text(extraction.model_dump_json(), encoding="utf-8")
+
+
 def extract_all_exam_pages(
-    model: ChatGoogleGenerativeAI, pages: list[tuple[int, str]], debug: bool = False
-) -> tuple[list[tuple[int, PageExtraction]], TokenUsage]:
+    pages: list[tuple[int, str]],
+    debug: bool = False,
+    max_workers: int = 4,
+    model_name: str = MODEL_NAME,
+    on_page_done: Callable[[int, int], None] | None = None,
+    cache_dir: Path | None = None,
+) -> tuple[list[tuple[int, PageExtraction]], TokenUsage, list[int]]:
     """Extrai questões de todas as páginas de uma prova.
 
     Args:
-        model: Instância do modelo Gemini.
         pages: Lista de tuplas (número_página, imagem_base64).
         debug: Se True, imprime a resposta raw do modelo para cada página.
+        max_workers: Número de threads concorrentes para chamadas à API.
+        model_name: Nome do modelo Gemini a utilizar.
+        on_page_done: Callback (page_num, num_questions) chamado após cada página.
+        cache_dir: Diretório para cache por página. Se None, sem cache.
 
     Returns:
-        Tupla (lista de (número_página, PageExtraction), TokenUsage total).
+        Tupla (extractions, usage, failed_pages).
     """
-    results = []
     total_usage = TokenUsage()
+    results: list[tuple[int, PageExtraction]] = []
+    failed_pages: list[int] = []
 
+    # Carregar páginas cacheadas
+    pages_to_process: list[tuple[int, str]] = []
     for page_num, image_base64 in pages:
-        print(f"  Processando página {page_num}...")
-        try:
-            extraction, usage = extract_exam_page(model, image_base64, debug=debug)
-            results.append((page_num, extraction))
-            total_usage.add(usage)
-            if extraction.questoes:
-                print(f"    → {len(extraction.questoes)} questão(ões) encontrada(s)")
-            else:
-                print("    → Página sem questões")
-        except Exception as e:
-            print(f"    → Erro na página {page_num}: {e}")
-            results.append((page_num, PageExtraction(questoes=[])))
+        if cache_dir:
+            cached = _load_page_cache(cache_dir, page_num, PageExtraction)
+            if cached is not None:
+                results.append((page_num, cached))
+                if on_page_done:
+                    on_page_done(page_num, len(cached.questoes))
+                continue
+        pages_to_process.append((page_num, image_base64))
 
-    return results, total_usage
+    if not pages_to_process:
+        results.sort(key=lambda x: x[0])
+        return results, total_usage, failed_pages
+
+    def _process_page(page_num: int, image_base64: str) -> tuple[int, PageExtraction, TokenUsage]:
+        model = create_model(model_name)
+        last_error = None
+        for attempt in range(3):
+            try:
+                extraction, usage = extract_exam_page(model, image_base64, debug=debug)
+                if attempt > 0:
+                    ui.info(f"  Pg {page_num}: OK (tentativa {attempt + 1})")
+                if on_page_done:
+                    on_page_done(page_num, len(extraction.questoes))
+                if cache_dir:
+                    _save_page_cache(cache_dir, page_num, extraction)
+                return page_num, extraction, usage
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    delay = 1.0 * (2 ** attempt)
+                    time.sleep(delay)
+        # Todas as tentativas falharam
+        ui.warn(f"  Pg {page_num}: falhou 3x — {last_error}")
+        raise last_error  # type: ignore[misc]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_page, page_num, img): page_num
+            for page_num, img in pages_to_process
+        }
+        for future in as_completed(futures):
+            page_num = futures[future]
+            try:
+                pn, extraction, usage = future.result()
+                results.append((pn, extraction))
+                total_usage.add(usage)
+            except Exception:
+                failed_pages.append(page_num)
+                if on_page_done:
+                    on_page_done(page_num, 0)
+                results.append((page_num, PageExtraction(questoes=[])))
+
+    results.sort(key=lambda x: x[0])
+    failed_pages.sort()
+    return results, total_usage, failed_pages
 
 
 def extract_all_gabarito_pages(
-    model: ChatGoogleGenerativeAI, pages: list[tuple[int, str]]
-) -> tuple[list[GabaritoExtraction], TokenUsage]:
+    pages: list[tuple[int, str]],
+    max_workers: int = 4,
+    model_name: str = MODEL_NAME,
+    on_page_done: Callable[[int, int], None] | None = None,
+    cache_dir: Path | None = None,
+) -> tuple[list[GabaritoExtraction], TokenUsage, list[int]]:
     """Extrai respostas de todas as páginas de um gabarito.
 
     Args:
-        model: Instância do modelo Gemini.
         pages: Lista de tuplas (número_página, imagem_base64).
+        max_workers: Número de threads concorrentes para chamadas à API.
+        model_name: Nome do modelo Gemini a utilizar.
+        on_page_done: Callback (page_num, num_answers) chamado após cada página.
+        cache_dir: Diretório para cache por página. Se None, sem cache.
 
     Returns:
-        Tupla (lista de GabaritoExtraction, TokenUsage total).
+        Tupla (extractions, usage, failed_pages).
     """
-    results = []
     total_usage = TokenUsage()
+    results: list[tuple[int, GabaritoExtraction]] = []
+    failed_pages: list[int] = []
 
+    # Carregar páginas cacheadas
+    pages_to_process: list[tuple[int, str]] = []
     for page_num, image_base64 in pages:
-        print(f"  Processando página {page_num} do gabarito...")
-        try:
-            extraction, usage = extract_gabarito_page(model, image_base64)
-            results.append(extraction)
-            total_usage.add(usage)
-            print(f"    → {len(extraction.respostas)} resposta(s) encontrada(s)")
-        except Exception as e:
-            print(f"    → Erro na página {page_num}: {e}")
-            results.append(GabaritoExtraction(respostas=[]))
+        if cache_dir:
+            cached = _load_page_cache(cache_dir, page_num, GabaritoExtraction)
+            if cached is not None:
+                results.append((page_num, cached))
+                if on_page_done:
+                    on_page_done(page_num, len(cached.respostas))
+                continue
+        pages_to_process.append((page_num, image_base64))
 
-    return results, total_usage
+    if not pages_to_process:
+        results.sort(key=lambda x: x[0])
+        return [ext for _, ext in results], total_usage, failed_pages
+
+    def _process_page(page_num: int, image_base64: str) -> tuple[int, GabaritoExtraction, TokenUsage]:
+        model = create_model(model_name)
+        last_error = None
+        for attempt in range(3):
+            try:
+                extraction, usage = extract_gabarito_page(model, image_base64)
+                if attempt > 0:
+                    ui.info(f"  Gabarito pg {page_num}: OK (tentativa {attempt + 1})")
+                if on_page_done:
+                    on_page_done(page_num, len(extraction.respostas))
+                if cache_dir:
+                    _save_page_cache(cache_dir, page_num, extraction)
+                return page_num, extraction, usage
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    delay = 1.0 * (2 ** attempt)
+                    time.sleep(delay)
+        ui.warn(f"  Gabarito pg {page_num}: falhou 3x — {last_error}")
+        raise last_error  # type: ignore[misc]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_page, page_num, img): page_num
+            for page_num, img in pages_to_process
+        }
+        for future in as_completed(futures):
+            page_num = futures[future]
+            try:
+                pn, extraction, usage = future.result()
+                results.append((pn, extraction))
+                total_usage.add(usage)
+            except Exception:
+                failed_pages.append(page_num)
+                if on_page_done:
+                    on_page_done(page_num, 0)
+                results.append((page_num, GabaritoExtraction(respostas=[])))
+
+    results.sort(key=lambda x: x[0])
+    failed_pages.sort()
+    return [ext for _, ext in results], total_usage, failed_pages

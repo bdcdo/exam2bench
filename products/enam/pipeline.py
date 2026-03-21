@@ -1,5 +1,6 @@
-"""Orquestrador para construção do dataset OAB completo."""
+"""Orquestrador para construção do dataset ENAM completo."""
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -7,42 +8,48 @@ from exam2bench.exporter import export_to_csv, export_to_jsonl
 from exam2bench.models import ExamQuestion
 from exam2bench import ui
 
-from .area_map import get_area_for_question
-from .converter import parse_raw_oab_file
+from .subject_map import get_subject_for_question
 
 
-def _convert_legacy_exams(raw_dir: Path) -> list[ExamQuestion]:
-    """Converte edições 1-25 dos arquivos .txt raw."""
-    all_questions = []
-    txt_files = sorted(raw_dir.glob("*.txt"))
+def _extract_edition_info(exam_name: str) -> dict:
+    """Extrai metadados do nome do exame (ex: 'enam-20241' → edição '20241', ano 2024)."""
+    m = re.search(r"enam-(\d{4})(\d)(r?)", exam_name)
+    if not m:
+        return {}
+    year = int(m.group(1))
+    semester = int(m.group(2))
+    reapplication = bool(m.group(3))
+    edition_id = f"{year}{semester}{'r' if reapplication else ''}"
+    return {
+        "edition": edition_id,
+        "year": year,
+        "semester": semester,
+        "reapplication": reapplication,
+        "source_format": "pdf",
+    }
 
-    if not txt_files:
-        ui.warn(f"Nenhum arquivo .txt encontrado em {raw_dir}")
-        return all_questions
 
-    for txt_file in txt_files:
-        questions = parse_raw_oab_file(txt_file)
-        all_questions.extend(questions)
-
-    ui.info(f"{len(txt_files)} arquivos, {len(all_questions)} questões")
-    return all_questions
+def _enrich_metadata(questions: list[ExamQuestion], exam_name: str) -> list[ExamQuestion]:
+    """Enriquece questões com metadados de edição e matéria."""
+    meta = _extract_edition_info(exam_name)
+    for q in questions:
+        q.metadata.update(meta)
+        subject = get_subject_for_question(
+            meta.get("edition", ""), q.question_number
+        )
+        if subject:
+            q.metadata["subject"] = subject
+    return questions
 
 
 def _load_from_cache(cache_file: Path) -> list[ExamQuestion]:
     """Carrega questões de um arquivo cache JSONL."""
     with open(cache_file, encoding="utf-8") as f:
-        return [ExamQuestion.model_validate_json(line) for line in f if line.strip()]
-
-
-def _enrich_with_areas(questions: list[ExamQuestion]) -> list[ExamQuestion]:
-    """Aplica metadados de área jurídica às questões."""
-    for q in questions:
-        edition = q.metadata.get("edition")
-        if edition:
-            area = get_area_for_question(edition, q.question_number)
-            if area:
-                q.metadata["area"] = area
-    return questions
+        return [
+            ExamQuestion.model_validate_json(line)
+            for line in f
+            if line.strip()
+        ]
 
 
 def _process_one_exam(
@@ -76,13 +83,13 @@ def _process_one_exam(
     )
 
     questions = _load_from_cache(output_path)
-    return _enrich_with_areas(questions), num_failed
+    return _enrich_metadata(questions, exam_name), num_failed
 
 
 def _process_pdf_exams(
     pdf_dir: Path, force: bool = False, max_workers: int = 4,
 ) -> list[ExamQuestion]:
-    """Processa edições 26+ dos PDFs via pipeline core."""
+    """Processa edições do ENAM a partir de PDFs."""
     from exam2bench.pairing import find_exam_pairs
 
     if not pdf_dir.exists():
@@ -104,7 +111,7 @@ def _process_pdf_exams(
             cache_file = cache_dir / f"{exam_name}.jsonl"
             if cache_file.exists() and not force:
                 questions = _load_from_cache(cache_file)
-                questions = _enrich_with_areas(questions)
+                questions = _enrich_metadata(questions, exam_name)
                 all_questions.extend(questions)
                 progress.exam_cached(exam_name, len(questions))
             else:
@@ -113,7 +120,7 @@ def _process_pdf_exams(
         if not to_process:
             return all_questions
 
-        # Criar tasks para exames pendentes
+        # Criar tasks para exames pendentes (total inicial = 1, atualizado depois)
         exam_tasks = {}
         for prova, gabarito, name in to_process:
             tid = progress.add_exam(name, total_pages=1)
@@ -143,20 +150,22 @@ def _process_pdf_exams(
 def _export_dataset(
     questions: list[ExamQuestion], output_dir: Path, fmt: str
 ) -> Path:
-    """Exporta o dataset completo e arquivos individuais por edição."""
+    """Exporta dataset completo e per-edition."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     questions.sort(
-        key=lambda q: (q.metadata.get("edition", 0), q.question_number)
+        key=lambda q: (q.metadata.get("edition", ""), q.question_number)
     )
 
+    main_path = None
     if fmt in ("jsonl", "both"):
-        main_path = output_dir / "oab-exams.jsonl"
+        main_path = output_dir / "enam-exams.jsonl"
         export_to_jsonl(questions, main_path, quiet=True)
     if fmt in ("csv", "both"):
-        main_path = output_dir / "oab-exams.csv"
+        main_path = output_dir / "enam-exams.csv"
         export_to_csv(questions, main_path, quiet=True)
 
+    # Per-edition
     editions: dict[str, list[ExamQuestion]] = {}
     for q in questions:
         editions.setdefault(q.exam_source, []).append(q)
@@ -171,40 +180,33 @@ def _export_dataset(
             export_to_csv(qs, per_edition_dir / f"{source}.csv", quiet=True)
 
     if fmt == "both":
-        return output_dir / "oab-exams.jsonl"
-    return output_dir / f"oab-exams.{'jsonl' if fmt == 'jsonl' else 'csv'}"
+        return output_dir / "enam-exams.jsonl"
+    return main_path or output_dir / "enam-exams.jsonl"
 
 
-def build_oab_dataset(
-    raw_dir: Path,
+def build_enam_dataset(
     pdf_dir: Path,
     output_dir: Path,
     fmt: str = "jsonl",
     force: bool = False,
     max_workers: int = 4,
 ) -> Path:
-    """Constrói o dataset OAB completo."""
-    ui.header("OAB Dataset Builder")
+    """Constrói o dataset ENAM completo."""
+    ui.header("ENAM Dataset Builder")
 
-    # 1. Converter edições legado
-    ui.section("[1/3] Convertendo edições legado")
-    legacy = _convert_legacy_exams(raw_dir)
+    # Processar PDFs
+    ui.section(f"[1/2] Processando PDFs ({max_workers} workers)")
+    questions = _process_pdf_exams(pdf_dir, force, max_workers)
 
-    # 2. Processar PDFs
-    ui.section(f"[2/3] Processando PDFs ({max_workers} workers)")
-    pdf_questions = _process_pdf_exams(pdf_dir, force, max_workers)
-
-    all_questions = legacy + pdf_questions
-
-    # 3. Exportar
-    ui.section("[3/3] Exportando dataset...")
-    output_path = _export_dataset(all_questions, output_dir, fmt)
+    # Exportar
+    ui.section("[2/2] Exportando dataset...")
+    output_path = _export_dataset(questions, output_dir, fmt)
 
     # Resumo
-    editions = {q.metadata.get("edition") for q in all_questions} - {None}
-    ui.summary("Dataset OAB gerado com sucesso!", {
-        "Questões": f"{len(all_questions)} ({len(legacy)} legado + {len(pdf_questions)} PDF)",
-        "Edições": f"{len(editions)} ({min(editions or {0})} a {max(editions or {0})})",
+    editions = {q.metadata.get("edition") for q in questions} - {None}
+    ui.summary("Dataset ENAM gerado com sucesso!", {
+        "Questões": str(len(questions)),
+        "Edições": str(len(editions)),
         "Saída": str(output_path),
     })
 

@@ -1,12 +1,13 @@
 """CLI principal para extração de questões de provas de concursos públicos."""
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
 
 from .exporter import export_to_csv, export_to_jsonl
 from .extractor import (
+    MODEL_NAME,
     TokenUsage,
-    create_model,
     extract_all_exam_pages,
     extract_all_gabarito_pages,
 )
@@ -18,6 +19,7 @@ from .merger import (
 from .models import ExamQuestion
 from .pairing import find_exam_pairs
 from .pdf_processor import pdf_to_base64_images
+from . import ui
 
 
 def exam_already_processed(exam_name: str, output_dir: Path, fmt: str) -> bool:
@@ -40,10 +42,10 @@ def _export(questions: list[ExamQuestion], output_dir: Path, exam_name: str, fmt
 
     if fmt in ("jsonl", "both"):
         path = output_dir / f"{exam_name}.jsonl"
-        export_to_jsonl(questions, path)
+        export_to_jsonl(questions, path, quiet=True)
     if fmt in ("csv", "both"):
         path = output_dir / f"{exam_name}.csv"
-        export_to_csv(questions, path)
+        export_to_csv(questions, path, quiet=True)
 
     if fmt == "both":
         return output_dir / f"{exam_name}.jsonl"
@@ -60,63 +62,80 @@ def process_exam(
     fmt: str = "jsonl",
     model_name: str | None = None,
     debug: bool = False,
-) -> tuple[Path, TokenUsage]:
+    max_workers: int = 4,
+    quiet: bool = False,
+    on_page_done: Callable[[int, int], None] | None = None,
+) -> tuple[Path, TokenUsage, int, int]:
     """Processa um par prova/gabarito e gera o output.
 
     Returns:
-        Tupla (caminho do arquivo gerado, TokenUsage total).
+        Tupla (caminho, TokenUsage, total_questões, total_páginas_falhadas).
     """
-    print(f"\n{'='*60}")
-    print(f"Processando: {exam_name}")
-    print(f"{'='*60}")
-
     total_usage = TokenUsage()
+    effective_model = model_name or MODEL_NAME
+    log = ui.info if not quiet else lambda *a: None
 
-    # Criar modelo
-    print("\nInicializando modelo Gemini...")
-    model = create_model(model_name) if model_name else create_model()
+    if not quiet:
+        ui.header(f"Processando: {exam_name}")
+
+    # Cache por página
+    page_cache_base = output_dir / ".pages" / exam_name
+    prova_cache = page_cache_base / "prova"
+    gabarito_cache = page_cache_base / "gabarito"
 
     # 1. Converter PDFs para imagens
-    print(f"\nConvertendo prova para imagens...")
+    log(f"Convertendo prova para imagens...")
     prova_pages = pdf_to_base64_images(prova_path)
-    print(f"  → {len(prova_pages)} páginas")
+    log(f"  {len(prova_pages)} páginas")
 
-    print(f"\nConvertendo gabarito para imagens...")
+    log(f"Convertendo gabarito para imagens...")
     gabarito_pages = pdf_to_base64_images(gabarito_path)
-    print(f"  → {len(gabarito_pages)} páginas")
+    log(f"  {len(gabarito_pages)} páginas")
 
     # 2. Extrair questões da prova
-    print(f"\nExtraindo questões da prova...")
-    page_extractions, exam_usage = extract_all_exam_pages(model, prova_pages, debug=debug)
+    log(f"Extraindo questões ({max_workers} workers)...")
+    page_extractions, exam_usage, prova_failed = extract_all_exam_pages(
+        prova_pages, debug=debug, max_workers=max_workers,
+        model_name=effective_model, on_page_done=on_page_done,
+        cache_dir=prova_cache,
+    )
     total_usage.add(exam_usage)
 
     # 3. Mesclar questões de múltiplas páginas
-    print(f"\nMesclando questões...")
-    questions = merge_multi_page_questions(page_extractions)
-    print(f"  → {len(questions)} questões encontradas")
+    questions, num_dupes = merge_multi_page_questions(page_extractions)
+    log(f"  {len(questions)} questões encontradas")
+    if num_dupes > 0:
+        ui.warn(f"{num_dupes} duplicata(s) mesclada(s) (fronteira de página)")
 
     # 4. Extrair gabarito
-    print(f"\nExtraindo gabarito...")
-    gabarito_extractions, gabarito_usage = extract_all_gabarito_pages(model, gabarito_pages)
+    log(f"Extraindo gabarito ({max_workers} workers)...")
+    gabarito_extractions, gabarito_usage, gabarito_failed = extract_all_gabarito_pages(
+        gabarito_pages, max_workers=max_workers,
+        model_name=effective_model, on_page_done=on_page_done,
+        cache_dir=gabarito_cache,
+    )
     total_usage.add(gabarito_usage)
     gabarito_answers = collect_gabarito_answers(gabarito_extractions)
-    print(f"  → {len(gabarito_answers)} respostas encontradas")
+    log(f"  {len(gabarito_answers)} respostas encontradas")
+
+    # Reportar falhas (sempre, mesmo em quiet)
+    all_failed = prova_failed + [f"gab-{p}" for p in gabarito_failed]
+    if all_failed:
+        ui.warn(f"{exam_name}: páginas falharam: {all_failed}")
 
     # 5. Combinar questões com gabarito
-    print(f"\nCombinando questões com gabarito...")
     merged_questions = merge_questions_with_gabarito(
         questions, gabarito_answers, exam_name
     )
 
-    # Verificar questões sem resposta
     nullified = [q for q in merged_questions if q.nullified]
-    if nullified:
-        print(f"  Aviso: {len(nullified)} questão(ões) anulada(s)")
+    if nullified and not quiet:
+        ui.warn(f"{len(nullified)} questão(ões) anulada(s)")
 
     # 6. Exportar
     output_path = _export(merged_questions, output_dir, exam_name, fmt)
 
-    return output_path, total_usage
+    return output_path, total_usage, len(merged_questions), len(prova_failed) + len(gabarito_failed)
 
 
 def process_single(
@@ -126,13 +145,22 @@ def process_single(
     fmt: str = "jsonl",
     model_name: str | None = None,
     debug: bool = False,
+    max_workers: int = 4,
 ) -> None:
     """Processa um único par de PDFs."""
     exam_name = prova_path.stem
-    output_path, usage = process_exam(
-        prova_path, gabarito_path, exam_name, output_dir, fmt, model_name, debug
+    output_path, usage, num_questions, num_failed = process_exam(
+        prova_path, gabarito_path, exam_name, output_dir, fmt, model_name, debug,
+        max_workers=max_workers,
     )
-    print(f"\nTokens utilizados:\n  {usage}")
+    items = {
+        "Questões": str(num_questions),
+        "Saída": str(output_path),
+        "Tokens": str(usage),
+    }
+    if num_failed > 0:
+        items["Falhas"] = f"{num_failed} página(s)"
+    ui.summary("Concluído!", items)
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
@@ -143,82 +171,68 @@ def cmd_extract(args: argparse.Namespace) -> None:
     # Modo single
     if args.single:
         if not args.gabarito:
-            print("Erro: --gabarito é obrigatório com --single")
+            ui.error("--gabarito é obrigatório com --single")
             return
         process_single(
             Path(args.single), Path(args.gabarito), output_dir,
-            args.format, args.model, args.debug,
+            args.format, args.model, args.debug, args.workers,
         )
         return
 
-    print("=" * 60)
-    print("exam2bench - Extrator de Questões de Concursos")
-    print("=" * 60)
+    ui.header("exam2bench - Extrator de Questões de Concursos")
 
     if args.debug:
-        print("\n[MODO DEBUG ATIVADO]")
+        ui.warn("MODO DEBUG ATIVADO")
 
     if not exams_dir.exists():
-        print(f"\nErro: Diretório '{exams_dir}' não encontrado.")
+        ui.error(f"Diretório '{exams_dir}' não encontrado.")
         return
 
-    # Encontrar pares de prova/gabarito
     pairs = find_exam_pairs(exams_dir, args.prova_suffix, args.gabarito_suffix)
 
     if not pairs:
-        print(f"\nNenhum par prova/gabarito encontrado em '{exams_dir}'.")
+        ui.error(f"Nenhum par prova/gabarito encontrado em '{exams_dir}'.")
         return
 
-    print(f"\nEncontrados {len(pairs)} par(es) de prova/gabarito:")
+    ui.info(f"Encontrados {len(pairs)} par(es):")
     for _, _, name in pairs:
-        print(f"  - {name}")
+        ui.info(f"  - {name}")
 
-    # Processar cada par
     results = []
     skipped = []
     grand_total_usage = TokenUsage()
 
     for prova, gabarito, name in pairs:
         if not args.force and exam_already_processed(name, output_dir, args.format):
-            print(f"\n→ Pulando '{name}' (já existe em {output_dir}/)")
+            ui.info(f"Pulando '{name}' (já processado)")
             skipped.append(name)
             continue
 
         try:
-            output_path, usage = process_exam(
+            output_path, usage, num_q, _ = process_exam(
                 prova, gabarito, name, output_dir,
-                args.format, args.model, args.debug,
+                args.format, args.model, args.debug, args.workers,
             )
             results.append((name, output_path, None, usage))
             grand_total_usage.add(usage)
         except Exception as e:
-            print(f"\nErro ao processar {name}: {e}")
+            ui.error(f"Erro ao processar {name}: {e}")
             results.append((name, None, str(e), TokenUsage()))
 
-    # Resumo final
-    print("\n" + "=" * 60)
-    print("RESUMO")
-    print("=" * 60)
+    # Resumo
+    successful = [(name, path) for name, path, err, _ in results if path]
+    failed = [(name, err) for name, _, err, _ in results if err]
 
-    successful = [(name, path, usage) for name, path, err, usage in results if path]
-    failed = [(name, err) for name, path, err, usage in results if err]
-
+    items = {}
     if successful:
-        print(f"\nProcessados com sucesso ({len(successful)}):")
-        for name, path, usage in successful:
-            print(f"  ✓ {name} → {path}")
-
+        items["Processados"] = ", ".join(n for n, _ in successful)
     if skipped:
-        print(f"\nPulados - já existem ({len(skipped)}):")
-        for name in skipped:
-            print(f"  ⊘ {name}")
-
+        items["Pulados"] = ", ".join(skipped)
     if failed:
-        print(f"\nFalharam ({len(failed)}):")
-        for name, err in failed:
-            print(f"  ✗ {name}: {err}")
+        items["Falharam"] = ", ".join(f"{n}: {e}" for n, e in failed)
+    items["Tokens"] = str(grand_total_usage)
 
-    print(f"\nTokens utilizados:\n  {grand_total_usage}")
+    ui.summary("RESUMO", items)
 
 
 def cmd_oab_build(args: argparse.Namespace) -> None:
@@ -231,6 +245,43 @@ def cmd_oab_build(args: argparse.Namespace) -> None:
         output_dir=Path(args.output_dir),
         fmt=args.format,
         force=args.force,
+        max_workers=args.workers,
+    )
+
+
+def cmd_enam_build(args: argparse.Namespace) -> None:
+    """Subcomando enam build: construir dataset ENAM completo."""
+    from products.enam.pipeline import build_enam_dataset
+
+    build_enam_dataset(
+        pdf_dir=Path(args.pdf_dir),
+        output_dir=Path(args.output_dir),
+        fmt=args.format,
+        force=args.force,
+        max_workers=args.workers,
+    )
+
+
+def cmd_build_all(args: argparse.Namespace) -> None:
+    """Subcomando build-all: construir ENAM e OAB (ENAM primeiro)."""
+    from products.enam.pipeline import build_enam_dataset
+    from products.oab.pipeline import build_oab_dataset
+
+    build_enam_dataset(
+        pdf_dir=Path(args.enam_pdf_dir),
+        output_dir=Path(args.enam_output_dir),
+        fmt=args.format,
+        force=args.force,
+        max_workers=args.workers,
+    )
+
+    build_oab_dataset(
+        raw_dir=Path(args.oab_raw_dir),
+        pdf_dir=Path(args.oab_pdf_dir),
+        output_dir=Path(args.oab_output_dir),
+        fmt=args.format,
+        force=args.force,
+        max_workers=args.workers,
     )
 
 
@@ -268,6 +319,10 @@ def main():
         "--model", default=None,
         help="Modelo Gemini a utilizar (default: gemini-3-pro-preview)",
     )
+    extract_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Workers concorrentes para chamadas à API (default: 4)",
+    )
     extract_parser.add_argument("--force", action="store_true", help="Reprocessar")
     extract_parser.add_argument("--debug", action="store_true", help="Modo verbose")
     extract_parser.add_argument(
@@ -301,8 +356,73 @@ def main():
         "--format", choices=["jsonl", "csv", "both"], default="jsonl",
         help="Formato de saída (default: jsonl)",
     )
+    build_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Workers concorrentes para chamadas à API (default: 4)",
+    )
     build_parser.add_argument("--force", action="store_true", help="Reprocessar")
     build_parser.set_defaults(func=cmd_oab_build)
+
+    # --- Subcomando: enam build ---
+    enam_parser = subparsers.add_parser("enam", help="Comandos do produto ENAM")
+    enam_subparsers = enam_parser.add_subparsers(dest="enam_command")
+
+    enam_build_parser = enam_subparsers.add_parser(
+        "build", help="Construir dataset ENAM completo"
+    )
+    enam_build_parser.add_argument(
+        "--pdf-dir", default="products/enam/exams",
+        help="Diretório com PDFs (default: products/enam/exams)",
+    )
+    enam_build_parser.add_argument(
+        "--output-dir", default="products/enam/output",
+        help="Diretório de saída (default: products/enam/output)",
+    )
+    enam_build_parser.add_argument(
+        "--format", choices=["jsonl", "csv", "both"], default="jsonl",
+        help="Formato de saída (default: jsonl)",
+    )
+    enam_build_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Workers concorrentes para chamadas à API (default: 4)",
+    )
+    enam_build_parser.add_argument("--force", action="store_true", help="Reprocessar")
+    enam_build_parser.set_defaults(func=cmd_enam_build)
+
+    # --- Subcomando: build-all ---
+    build_all_parser = subparsers.add_parser(
+        "build-all", help="Construir datasets ENAM e OAB (ENAM primeiro)",
+    )
+    build_all_parser.add_argument(
+        "--enam-pdf-dir", default="products/enam/exams",
+        help="Diretório com PDFs ENAM (default: products/enam/exams)",
+    )
+    build_all_parser.add_argument(
+        "--enam-output-dir", default="products/enam/output",
+        help="Diretório de saída ENAM (default: products/enam/output)",
+    )
+    build_all_parser.add_argument(
+        "--oab-raw-dir", default="products/oab/raw",
+        help="Diretório com .txt raw OAB (default: products/oab/raw)",
+    )
+    build_all_parser.add_argument(
+        "--oab-pdf-dir", default="products/oab/exams",
+        help="Diretório com PDFs OAB (default: products/oab/exams)",
+    )
+    build_all_parser.add_argument(
+        "--oab-output-dir", default="products/oab/output",
+        help="Diretório de saída OAB (default: products/oab/output)",
+    )
+    build_all_parser.add_argument(
+        "--format", choices=["jsonl", "csv", "both"], default="jsonl",
+        help="Formato de saída (default: jsonl)",
+    )
+    build_all_parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Workers concorrentes para chamadas à API (default: 4)",
+    )
+    build_all_parser.add_argument("--force", action="store_true", help="Reprocessar")
+    build_all_parser.set_defaults(func=cmd_build_all)
 
     args = parser.parse_args()
 
@@ -312,6 +432,10 @@ def main():
 
     if args.command == "oab" and not getattr(args, "oab_command", None):
         oab_parser.print_help()
+        return
+
+    if args.command == "enam" and not getattr(args, "enam_command", None):
+        enam_parser.print_help()
         return
 
     args.func(args)
