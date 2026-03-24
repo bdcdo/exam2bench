@@ -59,7 +59,8 @@ def collect_gabarito_answers(
     answers: dict[int, str] = {}
     for extraction in extractions:
         for answer in extraction.respostas:
-            answers[answer.numero] = answer.resposta
+            if answer.numero not in answers:
+                answers[answer.numero] = answer.resposta
     return answers
 
 

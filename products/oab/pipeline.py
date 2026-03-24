@@ -1,5 +1,6 @@
 """Orquestrador para construção do dataset OAB completo."""
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -34,12 +35,19 @@ def _load_from_cache(cache_file: Path) -> list[ExamQuestion]:
         return [ExamQuestion.model_validate_json(line) for line in f if line.strip()]
 
 
-def _enrich_with_areas(questions: list[ExamQuestion]) -> list[ExamQuestion]:
-    """Aplica metadados de área jurídica às questões."""
+def _enrich_with_areas(questions: list[ExamQuestion], exam_name: str = "") -> list[ExamQuestion]:
+    """Aplica metadados de edição e área jurídica às questões."""
+    # Extrair edição do nome (ex: "oab-26" → 26)
+    m = re.search(r"oab-(\d+)", exam_name)
+    edition = int(m.group(1)) if m else None
+
     for q in questions:
-        edition = q.metadata.get("edition")
-        if edition:
-            area = get_area_for_question(edition, q.question_number)
+        if edition is not None and "edition" not in q.metadata:
+            q.metadata["edition"] = edition
+            q.metadata["source_format"] = "pdf"
+        ed = q.metadata.get("edition")
+        if ed:
+            area = get_area_for_question(ed, q.question_number)
             if area:
                 q.metadata["area"] = area
     return questions
@@ -76,7 +84,7 @@ def _process_one_exam(
     )
 
     questions = _load_from_cache(output_path)
-    return _enrich_with_areas(questions), num_failed
+    return _enrich_with_areas(questions, exam_name), num_failed
 
 
 def _process_pdf_exams(
@@ -104,7 +112,7 @@ def _process_pdf_exams(
             cache_file = cache_dir / f"{exam_name}.jsonl"
             if cache_file.exists() and not force:
                 questions = _load_from_cache(cache_file)
-                questions = _enrich_with_areas(questions)
+                questions = _enrich_with_areas(questions, exam_name)
                 all_questions.extend(questions)
                 progress.exam_cached(exam_name, len(questions))
             else:
